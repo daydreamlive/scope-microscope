@@ -18,5 +18,9 @@ dev = [
     "daydream-scope",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.uv.sources]
 daydream-scope = { git = "https://github.com/daydreamlive/scope" }
