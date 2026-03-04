@@ -52,7 +52,7 @@ class MicroscopePipeline(Pipeline):
     def prepare(self, **kwargs) -> "Requirements":
         from scope.core.pipelines.interface import Requirements
 
-        return Requirements(input_size=1)
+        return Requirements(input_size=3)
 
     def __init__(
         self,
@@ -307,39 +307,19 @@ class MicroscopePipeline(Pipeline):
             rs = self.render_size
             return {"video": torch.zeros(1, rs, rs, 3)}
 
-        # Get the first frame as numpy
-        frame = video[0]
+        # Use the newest frame (last in list) to minimize latency
+        frame = video[-1]
         if hasattr(frame, "numpy"):
             frame = frame.numpy()
         frame = np.asarray(frame, dtype=np.uint8)
 
         # 7-stage pipeline
-        import time
-        t0 = time.perf_counter()
         image = self._preprocess(frame)
-        t1 = time.perf_counter()
         latent = self._vae_encode(image)
-        t2 = time.perf_counter()
         noisy = self._latent_noise(latent, latent_feedback)
-        t3 = time.perf_counter()
         noise_pred = self._unet_predict(noisy)
-        t4 = time.perf_counter()
         denoised = self._denoise(noisy, noise_pred)
-        t5 = time.perf_counter()
         decoded = self._vae_decode(denoised)
-        t6 = time.perf_counter()
         output = self._postprocess(decoded)
-        t7 = time.perf_counter()
-
-        self._prof_count = getattr(self, "_prof_count", 0) + 1
-        if self._prof_count % 30 == 0:
-            import sys
-            print(
-                f"[PROF] pre={1000*(t1-t0):.1f} vae_enc={1000*(t2-t1):.1f} "
-                f"noise={1000*(t3-t2):.1f} unet={1000*(t4-t3):.1f} "
-                f"denoise={1000*(t5-t4):.1f} vae_dec={1000*(t6-t5):.1f} "
-                f"post={1000*(t7-t6):.1f} total={1000*(t7-t0):.1f}ms",
-                file=sys.stderr, flush=True,
-            )
 
         return {"video": torch.from_numpy(output)}
