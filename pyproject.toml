@@ -2,11 +2,11 @@
 name = "scope-microscope"
 version = "0.1.0"
 description = "Microscope plugin for Daydream Scope — CoreML real-time style transfer"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "coremltools>=8.0",
     "transformers",
-    "diffusers",
 ]
 
 [project.entry-points.scope]

@@ -12,27 +12,47 @@
 
 import logging
 import platform
-import sys
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 
-from .convert import MODEL_CONFIGS, ensure_models_converted
+from scope.core.config import get_model_file_path
+from scope.core.pipelines.interface import Pipeline
+
 from .noise_schedule import compute_noise_params
 from .schema import MicroscopeConfig
 
 if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
 
-from scope.core.pipelines.interface import Pipeline
-
 logger = logging.getLogger(__name__)
+
+MODEL_CONFIGS = {
+    "sdxs": {
+        "model_id": "IDKiro/sdxs-512-0.9",
+        "hidden_size": 1024,
+        "unet_prefix": "unet_sdxs_512",
+    },
+    "sd-turbo": {
+        "model_id": "stabilityai/sd-turbo",
+        "hidden_size": 1024,
+        "unet_prefix": "unet_sd_turbo",
+    },
+}
 
 
 class MicroscopePipeline(Pipeline):
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
         return MicroscopeConfig
+
+    def prepare(self, **kwargs) -> "Requirements":
+        from scope.core.pipelines.interface import Requirements
+
+        return Requirements(input_size=1)
 
     def __init__(
         self,
@@ -42,7 +62,9 @@ class MicroscopePipeline(Pipeline):
         **kwargs,
     ):
         if platform.system() != "Darwin":
-            raise RuntimeError("MicroscopePipeline requires macOS with Apple Silicon (CoreML)")
+            raise RuntimeError(
+                "MicroscopePipeline requires macOS with Apple Silicon (CoreML)"
+            )
 
         import coremltools as ct
         from transformers import CLIPTokenizer
@@ -54,37 +76,35 @@ class MicroscopePipeline(Pipeline):
         cfg = MODEL_CONFIGS[model_type]
         self.hidden_size = cfg["hidden_size"]
 
-        # Convert/load CoreML models
-        logger.info(f"Loading Microscope pipeline: {model_type} @ {render_size}x{render_size}")
-        model_dir = ensure_models_converted(model_type, render_size)
+        # Models are downloaded by Scope's artifact system to ~/.daydream-scope/models/microscope/
+        model_dir = get_model_file_path("microscope")
+        logger.info(
+            f"Loading Microscope pipeline: {model_type} @ {render_size}x{render_size}"
+        )
 
-        # Load CoreML models with appropriate compute units
+        # Compile .mlpackage -> .mlmodelc if needed, then load compiled models
         # VAE (tiny) -> CPU + Neural Engine to free GPU for UNet
         # UNet (large) -> CPU + GPU
         cu_vae = ct.ComputeUnit.CPU_AND_NE
         cu_unet = ct.ComputeUnit.CPU_AND_GPU
 
-        logger.info("Loading text_encoder...")
-        self.text_encoder = ct.models.MLModel(
-            str(model_dir / "text_encoder.mlmodelc"), compute_units=cu_unet
-        )
+        def load_compiled(name: str, compute_units):
+            pkg = model_dir / f"{name}.mlpackage"
+            compiled = model_dir / f"{name}.mlmodelc"
+            if not compiled.exists():
+                logger.info(f"Compiling {name}.mlpackage...")
+                subprocess.run(
+                    ["xcrun", "coremlcompiler", "compile", str(pkg), str(model_dir)],
+                    check=True,
+                    capture_output=True,
+                )
+            logger.info(f"Loading {name} (compiled)...")
+            return ct.models.CompiledMLModel(str(compiled), compute_units=compute_units)
 
-        logger.info("Loading vae_encoder...")
-        self.vae_encoder = ct.models.MLModel(
-            str(model_dir / f"taesd_encoder_{render_size}.mlmodelc"),
-            compute_units=cu_vae,
-        )
-
-        logger.info("Loading vae_decoder...")
-        self.vae_decoder = ct.models.MLModel(
-            str(model_dir / "taesd_decoder.mlmodelc"), compute_units=cu_vae
-        )
-
-        unet_name = cfg["unet_prefix"]
-        logger.info(f"Loading unet ({model_type})...")
-        self.unet = ct.models.MLModel(
-            str(model_dir / f"{unet_name}.mlmodelc"), compute_units=cu_unet
-        )
+        self.text_encoder = load_compiled("text_encoder", cu_unet)
+        self.vae_encoder = load_compiled(f"taesd_encoder_{render_size}", cu_vae)
+        self.vae_decoder = load_compiled("taesd_decoder", cu_vae)
+        self.unet = load_compiled(cfg["unet_prefix"], cu_unet)
 
         # Load tokenizer
         logger.info("Loading tokenizer...")
@@ -105,9 +125,9 @@ class MicroscopePipeline(Pipeline):
 
         # Generate fixed noise (seed 42)
         rng = np.random.RandomState(42)
-        self.fixed_noise = rng.randn(1, 4, self.latent_size, self.latent_size).astype(
-            np.float16
-        )
+        self.fixed_noise = rng.randn(
+            1, 4, self.latent_size, self.latent_size
+        ).astype(np.float16)
 
         # State
         self.prev_denoised: np.ndarray | None = None
@@ -285,7 +305,7 @@ class MicroscopePipeline(Pipeline):
         if not video:
             # Return black frame if no input
             rs = self.render_size
-            return {"video": np.zeros((1, rs, rs, 3), dtype=np.float32)}
+            return {"video": torch.zeros(1, rs, rs, 3)}
 
         # Get the first frame as numpy
         frame = video[0]
@@ -294,12 +314,32 @@ class MicroscopePipeline(Pipeline):
         frame = np.asarray(frame, dtype=np.uint8)
 
         # 7-stage pipeline
-        image = self._preprocess(frame)  # 1. Preprocess
-        latent = self._vae_encode(image)  # 2. VAE encode
-        noisy = self._latent_noise(latent, latent_feedback)  # 3. Latent noise
-        noise_pred = self._unet_predict(noisy)  # 4. UNet predict
-        denoised = self._denoise(noisy, noise_pred)  # 5. Denoise
-        decoded = self._vae_decode(denoised)  # 6. VAE decode
-        output = self._postprocess(decoded)  # 7. Postprocess
+        import time
+        t0 = time.perf_counter()
+        image = self._preprocess(frame)
+        t1 = time.perf_counter()
+        latent = self._vae_encode(image)
+        t2 = time.perf_counter()
+        noisy = self._latent_noise(latent, latent_feedback)
+        t3 = time.perf_counter()
+        noise_pred = self._unet_predict(noisy)
+        t4 = time.perf_counter()
+        denoised = self._denoise(noisy, noise_pred)
+        t5 = time.perf_counter()
+        decoded = self._vae_decode(denoised)
+        t6 = time.perf_counter()
+        output = self._postprocess(decoded)
+        t7 = time.perf_counter()
 
-        return {"video": output}
+        self._prof_count = getattr(self, "_prof_count", 0) + 1
+        if self._prof_count % 30 == 0:
+            import sys
+            print(
+                f"[PROF] pre={1000*(t1-t0):.1f} vae_enc={1000*(t2-t1):.1f} "
+                f"noise={1000*(t3-t2):.1f} unet={1000*(t4-t3):.1f} "
+                f"denoise={1000*(t5-t4):.1f} vae_dec={1000*(t6-t5):.1f} "
+                f"post={1000*(t7-t6):.1f} total={1000*(t7-t0):.1f}ms",
+                file=sys.stderr, flush=True,
+            )
+
+        return {"video": torch.from_numpy(output)}

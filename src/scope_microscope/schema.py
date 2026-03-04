@@ -1,9 +1,10 @@
 """Configuration schema for Microscope pipeline."""
 
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import Field
 
+from scope.core.pipelines.artifacts import Artifact, HuggingfaceRepoArtifact
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     ModeDefaults,
@@ -27,9 +28,22 @@ class MicroscopeConfig(BasePipelineConfig):
 
     modes = {"video": ModeDefaults(default=True, input_size=1)}
 
+    artifacts: ClassVar[list[Artifact]] = [
+        HuggingfaceRepoArtifact(
+            repo_id="junhyr/microscope",
+            files=[
+                "text_encoder.mlpackage",
+                "taesd_encoder_512.mlpackage",
+                "taesd_decoder.mlpackage",
+                "unet_sdxs_512.mlpackage",
+                "unet_sd_turbo.mlpackage",
+            ],
+        ),
+    ]
+
     # Load parameters (require pipeline reload)
     model_type: Literal["sdxs", "sd-turbo"] = Field(
-        default="sdxs",
+        default="sd-turbo",
         description="Diffusion model variant",
         json_schema_extra=ui_field_config(
             order=0, is_load_param=True, label="Model"
